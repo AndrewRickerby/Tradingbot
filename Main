@@ -1,0 +1,115 @@
+import yfinance as yf
+import pandas as pd
+from apscheduler.schedulers.blocking import BlockingScheduler
+from trading_ig import IGService
+from trading_ig.config import config
+from trading_ig.rest import IGException
+from trading_ig.lightstreamer import Subscription
+
+# IG Credentials
+API_KEY = "API key"
+USERNAME = "username here"
+PASSWORD = "put password here"
+ENVIRONMENT = "DEMO" 
+
+
+ig_service = IGService(username=USERNAME, password=PASSWORD, api_key=API_KEY, acc_type=ENVIRONMENT)
+ig_service.create_session()
+
+
+dataF = yf.download("EURUSD=X", start="2024-9-12", end="2024-11-11", interval='15m')
+
+
+def signal_generator(df):
+    open = df.Open.iloc[-1]
+    close = df.Close.iloc[-1]
+    previous_open = df.Open.iloc[-2]
+    previous_close = df.Close.iloc[-2]
+    
+    # Bearish Pattern
+    if (open > close and previous_open < previous_close and close < previous_open and open >= previous_close):
+        return 1  # Sell Signal
+
+    # Bullish Pattern
+    elif (open < close and previous_open > previous_close and close > previous_open and open <= previous_close):
+        return 2  # Buy Signal
+    
+    # No clear pattern
+    else:
+        return 0  # No signal
+
+
+signal = [0]  # Start with no signal
+for i in range(1, len(dataF)):
+    df = dataF[i-1:i+1]  # Look at the last two rows
+    signal.append(signal_generator(df))
+
+dataF["signal"] = signal
+print(dataF.signal.value_counts())  # Check signal distribution
+
+
+def get_live_prices(epic, resolution='15Min', n=3):
+    try:
+        response = ig_service.fetch_historical_prices_by_epic_and_num_points(
+            epic=epic, resolution=resolution, numpoints=n
+        )
+        prices = response['prices']
+        dfstream = pd.DataFrame({
+            'Open': [price['openPrice']['bid'] for price in prices],
+            'Close': [price['closePrice']['bid'] for price in prices],
+            'High': [price['highPrice']['bid'] for price in prices],
+            'Low': [price['lowPrice']['bid'] for price in prices]
+        })
+        return dfstream
+    except IGException as e:
+        print(f"Error fetching live prices: {e}")
+        return None
+
+
+def trading_job():
+    epic = "CS.D.EURUSD.CFD.IP"  # IG Market epic for EUR/USD
+    dfstream = get_live_prices(epic)
+
+    if dfstream is not None:
+        signal = signal_generator(dfstream.iloc[:-1,:])  # Generate signal for the current candle
+
+        # Calculate stop loss and take profit levels
+        previous_candleR = abs(dfstream['High'].iloc[-2] - dfstream['Low'].iloc[-2])
+        SLTPRatio = 2.0
+        SLBuy = dfstream['Open'].iloc[-1] - previous_candleR
+        SLSell = dfstream['Open'].iloc[-1] + previous_candleR
+        TPBuy = dfstream['Open'].iloc[-1] + previous_candleR * SLTPRatio
+        TPSell = dfstream['Open'].iloc[-1] - previous_candleR * SLTPRatio
+
+       
+        if signal == 1:  # Sell 
+            try:
+                order = ig_service.create_open_position(
+                    direction="SELL",
+                    epic=epic,
+                    size=1,
+                    order_type="MARKET",
+                    stop_distance=previous_candleR,
+                    limit_distance=previous_candleR * SLTPRatio
+                )
+                print("Sell Order Placed:", order)
+            except IGException as e:
+                print(f"Error placing sell order: {e}")
+        elif signal == 2:  # Buy
+            try:
+                order = ig_service.create_open_position(
+                    direction="BUY",
+                    epic=epic,
+                    size=1,
+                    order_type="MARKET",
+                    stop_distance=previous_candleR,
+                    limit_distance=previous_candleR * SLTPRatio
+                )
+                print("Buy Order Placed:", order)
+            except IGException as e:
+                print(f"Error placing buy order: {e}")
+
+
+scheduler = BlockingScheduler()
+scheduler.add_job(trading_job, 'interval', minutes=15)
+scheduler.start()
